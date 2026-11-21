@@ -1,5 +1,6 @@
 //! The Shuftle multiplayer server.
 
+use anyhow::Context;
 use shuftle_proto::{
     PROTOCOL_VERSION,
     shuftle::version::v1::{
@@ -16,17 +17,26 @@ use tonic_web::GrpcWebLayer;
 ///
 /// # Errors
 ///
-/// Returns the transport error that stopped the server.
+/// Returns the error that kept the server from starting or stopped it.
 pub async fn serve(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
-) -> Result<(), tonic::transport::Error> {
-    Server::builder()
-        .accept_http1(true)
+) -> anyhow::Result<()> {
+    let router = Server::builder()
+        .accept_http1(cfg!(feature = "dev"))
         .layer(GrpcWebLayer::new())
-        .add_service(VersionServiceServer::new(Version))
+        .add_service(VersionServiceServer::new(Version));
+    #[cfg(feature = "dev")]
+    let router = router.add_service(
+        tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(shuftle_proto::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .context("building the reflection service")?,
+    );
+    router
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
+        .context("serving")
 }
 
 /// Answers which protocol version the server speaks.

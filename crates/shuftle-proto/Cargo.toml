@@ -19,6 +19,7 @@ tonic.workspace = true
 tonic-prost.workspace = true
 
 [build-dependencies]
+prost.workspace = true
 anyhow.workspace = true
 protox.workspace = true
 semver.workspace = true

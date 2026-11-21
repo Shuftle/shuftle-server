@@ -14,6 +14,12 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tonic-web.workspace = true
+tonic-reflection = { workspace = true, optional = true }
+
+[features]
+# Development only: gRPC reflection for tools such as grpcurl, and HTTP/1.1 for browsers reaching
+# the server without TLS. Never in release builds.
+dev = ["dep:tonic-reflection"]
 
 [dev-dependencies]
 shuftle-proto = { workspace = true, features = ["client"] }

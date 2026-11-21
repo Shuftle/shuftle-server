@@ -10,3 +10,6 @@ pub use generated::shuftle;
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/protos.rs"));
 }
+
+/// The encoded descriptors of every protobuf file, for gRPC server reflection.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptors.bin"));

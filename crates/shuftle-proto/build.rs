@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use prost::Message;
 use semver::Version;
 
 fn main() -> anyhow::Result<()> {
@@ -19,6 +20,7 @@ fn main() -> anyhow::Result<()> {
     collect_protos(&proto_root, &mut protos)?;
     let descriptors = protox::compile(&protos, [&proto_root])?;
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    fs::write(out_dir.join("descriptors.bin"), descriptors.encode_to_vec())?;
     tonic_prost_build::configure()
         .client_mod_attribute(".", "#[cfg(feature = \"client\")]")
         // Keeps the stream message small: a snapshot is far larger than the other variants.

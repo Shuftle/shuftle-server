@@ -27,7 +27,5 @@ async fn main() -> anyhow::Result<()> {
             _ = interrupt.recv() => {}
         }
     };
-    shuftle_server::serve(listener, shutdown)
-        .await
-        .context("serving")
+    shuftle_server::serve(listener, shutdown).await
 }
