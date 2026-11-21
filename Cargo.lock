@@ -762,6 +762,10 @@ name = "shuftle-server"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper-util",
  "semver",
  "shuftle-proto",
  "test-utils",

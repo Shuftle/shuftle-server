@@ -1,4 +1,4 @@
-//! The version service, called over gRPC.
+//! The version service.
 
 use anyhow::ensure;
 use shuftle_proto::shuftle::version::v1::{

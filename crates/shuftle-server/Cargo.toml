@@ -25,6 +25,10 @@ dev = ["dep:tonic-reflection"]
 shuftle-proto = { workspace = true, features = ["client"] }
 semver.workspace = true
 test-utils.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper-util.workspace = true
 
 [lints]
 workspace = true
