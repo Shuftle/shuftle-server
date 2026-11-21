@@ -1,0 +1,3 @@
+[submodule "shuftle-protocol"]
+	path = shuftle-protocol
+	url = https://github.com/Shuftle/shuftle-protocol.git

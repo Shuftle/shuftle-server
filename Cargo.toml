@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+authors = ["Sebastiano Giordano"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/shuftle/shuftle-server"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+unwrap_in_result = "warn"
+todo = "warn"
+float_cmp = "warn"
+float_cmp_const = "warn"
+cast_lossless = "warn"
+cognitive_complexity = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

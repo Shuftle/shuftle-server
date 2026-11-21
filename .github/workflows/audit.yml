@@ -1,0 +1,32 @@
+name: Security audit & cargo deny
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/deny.toml"
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo deny ${{ matrix.checks }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # A newly published advisory does not block unrelated PRs; scheduled runs still fail on it.
+    continue-on-error: ${{ matrix.checks == 'advisories' && github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
