@@ -2,6 +2,7 @@
 
 use std::{
     convert::Infallible,
+    fmt::Debug,
     future,
     net::SocketAddr,
     sync::LazyLock,
@@ -31,7 +32,10 @@ use jsonwebtoken::{
     },
 };
 use pkcs8::PrivateKeyInfoRef;
-use proptest::test_runner::TestCaseError;
+use proptest::{
+    strategy::Strategy,
+    test_runner::{Config, TestCaseError, TestRunner},
+};
 use serde::Serialize;
 use shuftle_server::config::{Auth, Cors};
 use tokio::{net::TcpListener, runtime::Builder};
@@ -85,6 +89,38 @@ pub fn block_on<T>(future: impl Future<Output = anyhow::Result<T>>) -> Result<T,
         .map_err(|error| TestCaseError::fail(format!("{error:#}")))
 }
 
+/// Checks `property` on cases from `strategy` against one server shared by every case, on a
+/// single-threaded runtime of its own. `source` is the calling test's `file!()`, where proptest
+/// records failing cases.
+///
+/// # Errors
+///
+/// Returns the error that kept the server from starting, or the failing case after shrinking.
+pub fn check_against_server<S, F>(
+    source: &'static str,
+    strategy: &S,
+    property: impl Fn(SocketAddr, S::Value) -> F,
+) -> anyhow::Result<()>
+where
+    S: Strategy,
+    S::Value: Debug,
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let address = runtime.block_on(spawn_server())?;
+    let config = Config {
+        source_file: Some(source),
+        ..Config::default()
+    };
+    TestRunner::new(config)
+        .run(strategy, |value| {
+            runtime
+                .block_on(property(address, value))
+                .map_err(|error| TestCaseError::fail(format!("{error:#}")))
+        })
+        .map_err(|error| anyhow!("{error}"))
+}
+
 /// The content type of gRPC-Web requests and responses carrying protobuf.
 pub const GRPC_WEB: &str = "application/grpc-web+proto";
 
@@ -132,7 +168,7 @@ pub struct TestKey {
     /// The private half, signing tokens.
     encoding: EncodingKey,
     /// The public half, as the identity provider publishes it.
-    pub jwk: Jwk,
+    jwk: Jwk,
 }
 
 /// The test identity provider's keys, generated on first use: one it publishes, one it does not.
@@ -198,8 +234,17 @@ impl TestKey {
     ///
     /// Returns the error that kept the token from being signed.
     pub fn sign(&self, claims: &Claims) -> anyhow::Result<String> {
+        self.sign_naming(self, claims)
+    }
+
+    /// Signs `claims` as RS256 with this key, naming `named` in the header.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that kept the token from being signed.
+    pub fn sign_naming(&self, named: &Self, claims: &Claims) -> anyhow::Result<String> {
         let mut header = Header::new(Algorithm::RS256);
-        header.kid.clone_from(&self.jwk.common.key_id);
+        header.kid.clone_from(&named.jwk.common.key_id);
         Ok(jsonwebtoken::encode(&header, claims, &self.encoding)?)
     }
 }
@@ -208,13 +253,13 @@ impl TestKey {
 #[derive(Debug, Clone, Serialize)]
 pub struct Claims {
     /// The issuer.
-    iss: String,
+    pub iss: String,
     /// The audience.
-    aud: String,
+    pub aud: String,
     /// The subject: the player's id at the identity provider.
-    sub: String,
+    pub sub: String,
     /// When the token expires, in seconds since the Unix epoch.
-    exp: u64,
+    pub exp: u64,
 }
 
 impl Claims {

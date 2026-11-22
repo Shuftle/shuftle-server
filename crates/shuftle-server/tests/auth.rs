@@ -1,17 +1,28 @@
 //! Authentication: calls outside the public services need a valid access token.
 
+use std::{
+    net::SocketAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use anyhow::{Context, ensure};
 use http::uri::PathAndQuery;
-use proptest::{prop_assert, proptest, strategy::Strategy};
+use proptest::{
+    prop_oneof,
+    strategy::{Just, Strategy},
+};
 use prost::Message;
 use prost_types::FileDescriptorSet;
 use shuftle_proto::FILE_DESCRIPTOR_SET;
 use shuftle_proto::shuftle::matchmaking::v1::{
     EnqueueRequest, matchmaking_service_client::MatchmakingServiceClient,
 };
-use test_utils::{Claims, TestKey, block_on, spawn_server};
+use test_utils::{Claims, TestKey, check_against_server, spawn_server};
 use tonic::{Code, Request, Status, client::Grpc, metadata::MetadataValue, transport::Channel};
 use tonic_prost::ProstCodec;
+
+/// What the server tells callers whose token it refuses.
+const SIGN_IN_AGAIN: &str = "invalid access token, sign in again";
 
 /// The services anyone may call without a token.
 const PUBLIC_SERVICES: [&str; 1] = ["shuftle.version.v1.VersionService"];
@@ -54,58 +65,64 @@ async fn refuses_calls_without_a_token() -> anyhow::Result<()> {
     for (path, public) in methods()? {
         let result = call_without_token(channel.clone(), &path).await?;
         let refused = result.as_ref().is_err_and(|status| {
-            status.code() == Code::Unauthenticated
-                && status.message() == "missing authorization metadata"
+            status.code() == Code::Unauthenticated && status.message() == SIGN_IN_AGAIN
         });
         if public {
             ensure!(!refused, "{path} is public, got {result:?}");
         } else {
             ensure!(
                 refused,
-                "{path}: got {result:?}, expected UNAUTHENTICATED with \"missing authorization \
-                 metadata\""
+                "{path}: got {result:?}, expected UNAUTHENTICATED with {SIGN_IN_AGAIN:?}"
             );
         }
     }
     Ok(())
 }
 
-/// `authorization` values whose scheme is not `Bearer`, which RFC 7235 matches case-insensitively.
-fn non_bearer_authorization() -> impl Strategy<Value = String> {
-    "[!-~][ -~]{0,40}".prop_filter("Bearer scheme", |value| {
-        !value.to_ascii_lowercase().starts_with("bearer ")
-    })
-}
-
 /// A player id as the identity provider issues it.
 const PLAYER: &str = "6f1c7c4e-0b7a-4b5e-9d2a-3f8e2c1d5a90";
 
 #[tokio::test]
-async fn refuses_tokens_signed_with_unpublished_keys() -> anyhow::Result<()> {
-    let token = TestKey::unpublished()?.sign(&Claims::valid(PLAYER)?)?;
+async fn lets_valid_tokens_through() -> anyhow::Result<()> {
+    let token = TestKey::published()?.sign(&Claims::valid(PLAYER)?)?;
 
-    let result = enqueue_with_authorization(&format!("Bearer {token}")).await?;
+    let address = spawn_server().await?;
+    let result = enqueue_with_authorization(address, &format!("Bearer {token}")).await?;
 
-    let refused = result.as_ref().is_err_and(|status| {
-        status.code() == Code::Unauthenticated && status.message() == "unknown signing key"
-    });
+    // The empty matchmaking service answers UNIMPLEMENTED once a call gets past authentication.
     ensure!(
-        refused,
-        "got {result:?}, expected UNAUTHENTICATED with \"unknown signing key\""
+        result
+            .as_ref()
+            .is_err_and(|status| status.code() == Code::Unimplemented),
+        "got {result:?}, expected the call to reach the service and get UNIMPLEMENTED"
     );
     Ok(())
 }
 
-/// Bearer tokens (RFC 6750 `b64token` characters) that are not JWTs: dot-separated base64url
-/// segments whose header does not decode to a JOSE header.
-fn not_a_jwt() -> impl Strategy<Value = String> {
-    "[A-Za-z0-9_-]{1,20}(\\.[A-Za-z0-9_-]{0,20}){0,4}"
+#[tokio::test]
+async fn refuses_tokens_with_a_bad_signature() -> anyhow::Result<()> {
+    let token =
+        TestKey::unpublished()?.sign_naming(TestKey::published()?, &Claims::valid(PLAYER)?)?;
+
+    let address = spawn_server().await?;
+    let result = enqueue_with_authorization(address, &format!("Bearer {token}")).await?;
+
+    let refused = result.as_ref().is_err_and(|status| {
+        status.code() == Code::Unauthenticated && status.message() == SIGN_IN_AGAIN
+    });
+    ensure!(
+        refused,
+        "got {result:?}, expected UNAUTHENTICATED with {SIGN_IN_AGAIN:?}"
+    );
+    Ok(())
 }
 
-/// Calls `Enqueue`, standing in for any call that needs a token, with `authorization` set to
-/// `value`.
-async fn enqueue_with_authorization(value: &str) -> anyhow::Result<Result<(), Status>> {
-    let address = spawn_server().await?;
+/// Calls `Enqueue` on the server at `address`, standing in for any call that needs a token, with
+/// `authorization` set to `value`.
+async fn enqueue_with_authorization(
+    address: SocketAddr,
+    value: &str,
+) -> anyhow::Result<Result<(), Status>> {
     let mut client = MatchmakingServiceClient::connect(format!("http://{address}")).await?;
     let mut request = Request::new(EnqueueRequest::default());
     request
@@ -114,26 +131,74 @@ async fn enqueue_with_authorization(value: &str) -> anyhow::Result<Result<(), St
     Ok(client.enqueue(request).await.map(|_| ()))
 }
 
-proptest! {
-    #[test]
-    fn refuses_schemes_other_than_bearer(value in non_bearer_authorization()) {
-        let result = block_on(enqueue_with_authorization(&value))?;
+/// Strings other than `expected`: arbitrary text, and near misses that extend it or change its
+/// case.
+fn other_than(expected: String) -> impl Strategy<Value = String> {
+    let extended = expected.clone();
+    let recased = expected.to_uppercase();
+    prop_oneof![
+        "\\PC{0,40}",
+        "[ -~]{1,5}".prop_map(move |suffix| format!("{extended}{suffix}")),
+        Just(recased),
+    ]
+    .prop_filter("the expected value", move |other| *other != expected)
+}
 
-        prop_assert!(
-            result.as_ref().is_err_and(|status| status.code() == Code::Unauthenticated
-                && status.message() == "authorization is not a Bearer token"),
-            "got {result:?}, expected UNAUTHENTICATED with \"authorization is not a Bearer token\""
-        );
-    }
+/// Fails unless the server at `address` refuses a token carrying `claims`, signed with the
+/// published key.
+async fn ensure_refused(address: SocketAddr, claims: Claims) -> anyhow::Result<()> {
+    let token = TestKey::published()?.sign(&claims)?;
+    let result = enqueue_with_authorization(address, &format!("Bearer {token}")).await?;
 
-    #[test]
-    fn refuses_bearer_tokens_that_are_not_jwts(token in not_a_jwt()) {
-        let result = block_on(enqueue_with_authorization(&format!("Bearer {token}")))?;
+    ensure!(
+        result
+            .as_ref()
+            .is_err_and(|status| status.code() == Code::Unauthenticated
+                && status.message() == SIGN_IN_AGAIN),
+        "got {result:?}, expected UNAUTHENTICATED with {SIGN_IN_AGAIN:?}"
+    );
+    Ok(())
+}
 
-        prop_assert!(
-            result.as_ref().is_err_and(|status| status.code() == Code::Unauthenticated
-                && status.message() == "malformed token"),
-            "got {result:?}, expected UNAUTHENTICATED with \"malformed token\""
-        );
-    }
+#[test]
+fn refuses_tokens_from_other_issuers() -> anyhow::Result<()> {
+    let valid = Claims::valid(PLAYER)?;
+    check_against_server(file!(), &other_than(valid.iss.clone()), |address, iss| {
+        ensure_refused(
+            address,
+            Claims {
+                iss,
+                ..valid.clone()
+            },
+        )
+    })
+}
+
+#[test]
+fn refuses_tokens_for_other_audiences() -> anyhow::Result<()> {
+    let valid = Claims::valid(PLAYER)?;
+    check_against_server(file!(), &other_than(valid.aud.clone()), |address, aud| {
+        ensure_refused(
+            address,
+            Claims {
+                aud,
+                ..valid.clone()
+            },
+        )
+    })
+}
+
+#[test]
+fn refuses_expired_tokens() -> anyhow::Result<()> {
+    let valid = Claims::valid(PLAYER)?;
+    let an_hour_ago = SystemTime::now().duration_since(UNIX_EPOCH)? - Duration::from_hours(1);
+    check_against_server(file!(), &(0..=an_hour_ago.as_secs()), |address, exp| {
+        ensure_refused(
+            address,
+            Claims {
+                exp,
+                ..valid.clone()
+            },
+        )
+    })
 }

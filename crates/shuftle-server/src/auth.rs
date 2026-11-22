@@ -6,13 +6,14 @@ use std::{
     task::{Context, Poll},
 };
 
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use headers::{Authorization, HeaderMapExt, authorization::Bearer};
 use http::{HeaderMap, Request, Response};
 use jsonwebtoken::{
-    decode_header,
+    Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{Jwk, JwkSet},
 };
+use serde::de::IgnoredAny;
 use thiserror::Error;
 use tonic::Status;
 use tower_layer::Layer;
@@ -31,6 +32,7 @@ const REFLECTION_SERVICE: &str = "grpc.reflection.v1.ServerReflection";
 #[derive(Debug, Clone)]
 pub struct AuthLayer {
     keys: Arc<SigningKeys>,
+    validation: Arc<Validation>,
 }
 
 impl AuthLayer {
@@ -46,6 +48,7 @@ impl AuthLayer {
                 client: reqwest::Client::builder().build()?,
                 cached: RwLock::new(JwkSet { keys: Vec::new() }),
             }),
+            validation: Arc::new(validation(auth)),
         })
     }
 }
@@ -57,6 +60,7 @@ impl<S> Layer<S> for AuthLayer {
         Authenticated {
             inner,
             keys: Arc::clone(&self.keys),
+            validation: Arc::clone(&self.validation),
         }
     }
 }
@@ -66,6 +70,7 @@ impl<S> Layer<S> for AuthLayer {
 pub struct Authenticated<S> {
     inner: S,
     keys: Arc<SigningKeys>,
+    validation: Arc<Validation>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for Authenticated<S>
@@ -89,11 +94,12 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let keys = Arc::clone(&self.keys);
+        let validation = Arc::clone(&self.validation);
         Box::pin(async move {
             if is_public(request.uri().path()) {
                 return inner.call(request).await;
             }
-            match authenticate(&keys, request.headers()).await {
+            match authenticate(&keys, &validation, request.headers()).await {
                 Ok(()) => inner.call(request).await,
                 Err(refusal) => Ok(refusal.into_status().into_http()),
             }
@@ -101,16 +107,41 @@ where
     }
 }
 
-/// Checks the access token in `headers`.
-async fn authenticate(keys: &SigningKeys, headers: &HeaderMap) -> Result<(), Refusal> {
-    let Authorization(bearer) = match headers.typed_try_get::<Authorization<Bearer>>() {
-        Ok(Some(authorization)) => authorization,
-        Ok(None) => return Err(Rejection::Missing.into()),
-        Err(_) => return Err(Rejection::NotBearer.into()),
-    };
-    let header = decode_header(bearer.token()).map_err(|_| Rejection::Malformed)?;
-    let kid = header.kid.ok_or(Rejection::NoKeyId)?;
-    keys.find(&kid).await?.ok_or(Rejection::UnknownKey)?;
+/// The checks a token from the identity provider `auth` describes must pass.
+fn validation(auth: &Auth) -> Validation {
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[&auth.issuer]);
+    validation.set_audience(&[&auth.audience]);
+    validation
+}
+
+/// Checks the access token in `headers` against `validation`.
+async fn authenticate(
+    keys: &SigningKeys,
+    validation: &Validation,
+    headers: &HeaderMap,
+) -> Result<(), Refusal> {
+    let Authorization(bearer) = headers
+        .typed_try_get::<Authorization<Bearer>>()
+        .context("authorization is not a Bearer token")
+        .map_err(Refusal::Unauthenticated)?
+        .ok_or_else(|| Refusal::Unauthenticated(anyhow!("missing authorization metadata")))?;
+    let header = decode_header(bearer.token())
+        .context("malformed token")
+        .map_err(Refusal::Unauthenticated)?;
+    let kid = header
+        .kid
+        .ok_or_else(|| Refusal::Unauthenticated(anyhow!("the token names no signing key")))?;
+    let jwk = keys
+        .find(&kid)
+        .await?
+        .ok_or_else(|| Refusal::Unauthenticated(anyhow!("unknown signing key {kid}")))?;
+    let key = DecodingKey::from_jwk(&jwk)
+        .with_context(|| format!("unusable signing key {kid}"))
+        .map_err(Refusal::Unavailable)?;
+    decode::<IgnoredAny>(bearer.token(), &key, validation)
+        .with_context(|| format!("verifying the token signed by key {kid}"))
+        .map_err(Refusal::Unauthenticated)?;
     Ok(())
 }
 
@@ -125,64 +156,67 @@ struct SigningKeys {
 
 impl SigningKeys {
     /// The key named `kid`, refetching the key set when it is not cached.
-    async fn find(&self, kid: &str) -> anyhow::Result<Option<Jwk>> {
+    async fn find(&self, kid: &str) -> Result<Option<Jwk>, Refusal> {
         let cached = self
             .cached
             .read()
-            .map_err(|error| anyhow!("{error}"))?
+            .map_err(|error| Refusal::Internal(anyhow!("reading the key cache: {error}")))?
             .find(kid)
             .cloned();
         if cached.is_some() {
             return Ok(cached);
         }
-        let fresh: JwkSet = self
+        let fresh = self
+            .fetch()
+            .await
+            .with_context(|| format!("fetching the signing keys from {}", self.url))
+            .map_err(Refusal::Unavailable)?;
+        let found = fresh.find(kid).cloned();
+        *self
+            .cached
+            .write()
+            .map_err(|error| Refusal::Internal(anyhow!("writing the key cache: {error}")))? = fresh;
+        Ok(found)
+    }
+
+    /// The key set the identity provider publishes now.
+    async fn fetch(&self) -> anyhow::Result<JwkSet> {
+        Ok(self
             .client
             .get(self.url.clone())
             .send()
             .await?
             .error_for_status()?
             .json()
-            .await?;
-        let found = fresh.find(kid).cloned();
-        *self.cached.write().map_err(|error| anyhow!("{error}"))? = fresh;
-        Ok(found)
+            .await?)
     }
 }
 
-/// Why a call did not reach its service.
+/// Why a call did not reach its service: one variant per thing the caller must do. Each carries
+/// the chain of causes.
 #[derive(Debug, Error)]
 enum Refusal {
-    #[error(transparent)]
-    Rejected(#[from] Rejection),
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    /// The caller must sign in again.
+    #[error("invalid access token, sign in again")]
+    Unauthenticated(#[source] anyhow::Error),
+    /// The caller may retry later.
+    #[error("cannot verify access tokens right now, retry later")]
+    Unavailable(#[source] anyhow::Error),
+    /// A server bug the caller cannot act on.
+    #[error("internal server error")]
+    Internal(#[source] anyhow::Error),
 }
 
 impl Refusal {
-    /// The gRPC status telling the caller why.
+    /// The gRPC status telling the caller what to do.
     fn into_status(self) -> Status {
+        let message = self.to_string();
         match self {
-            Self::Rejected(rejection) => Status::unauthenticated(rejection.to_string()),
-            Self::Other(_) => {
-                Status::unavailable("the identity provider's signing keys are unavailable")
-            }
+            Self::Unauthenticated(_) => Status::unauthenticated(message),
+            Self::Unavailable(_) => Status::unavailable(message),
+            Self::Internal(_) => Status::internal(message),
         }
     }
-}
-
-/// Why a token was refused.
-#[derive(Debug, Error)]
-enum Rejection {
-    #[error("missing authorization metadata")]
-    Missing,
-    #[error("authorization is not a Bearer token")]
-    NotBearer,
-    #[error("malformed token")]
-    Malformed,
-    #[error("the token names no signing key")]
-    NoKeyId,
-    #[error("unknown signing key")]
-    UnknownKey,
 }
 
 /// Whether the call at `path` needs no token.
