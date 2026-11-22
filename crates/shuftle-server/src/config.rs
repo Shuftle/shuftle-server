@@ -49,6 +49,12 @@ impl TryFrom<String> for AllowedOrigin {
 }
 
 impl AllowedOrigin {
+    /// The origin as browsers send it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Checks that `input` is exactly the origin of the http or https URL it spells.
     fn check(input: &str) -> Result<(), Reason> {
         let url = HttpUrl::try_from(Url::parse(input).map_err(Reason::Unparsable)?)?;
@@ -99,4 +105,33 @@ enum Reason {
     UnsupportedScheme,
     #[error("did you mean `{expected}`?")]
     NotCanonical { expected: String },
+}
+
+/// Property-test strategies for configuration values.
+#[cfg(feature = "testing")]
+pub mod test_utils {
+    use proptest::{
+        option, prop_oneof,
+        strategy::{Just, Strategy},
+    };
+
+    /// The parts of an origin as browsers send it: a scheme with its default port, a lowercase host
+    /// and a port only when it is not the scheme's default.
+    pub fn origin_parts() -> impl Strategy<Value = (&'static str, u16, String, Option<u16>)> {
+        let scheme = prop_oneof![(Just("http"), Just(80_u16)), (Just("https"), Just(443_u16))];
+        let host = "[a-z][a-z0-9]{0,10}(\\.[a-z][a-z0-9]{0,10}){0,3}";
+        (scheme, host, option::of(1_u16..))
+            .prop_filter("default port", |((_, default_port), _, port)| {
+                *port != Some(*default_port)
+            })
+            .prop_map(|((scheme, default_port), host, port)| (scheme, default_port, host, port))
+    }
+
+    /// Origins written as browsers send them.
+    pub fn canonical_origin() -> impl Strategy<Value = String> {
+        origin_parts().prop_map(|(scheme, _, host, port)| match port {
+            Some(port) => format!("{scheme}://{host}:{port}"),
+            None => format!("{scheme}://{host}"),
+        })
+    }
 }

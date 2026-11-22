@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+http-body.workspace = true
+hyper-util.workspace = true
+proptest.workspace = true
 shuftle-server.workspace = true
 tokio.workspace = true
 

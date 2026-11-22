@@ -4,10 +4,13 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use anyhow::ensure;
 use proptest::{
-    option, prop_assert, prop_oneof, proptest, sample,
+    prop_assert, prop_oneof, proptest, sample,
     strategy::{Just, Strategy},
 };
-use shuftle_server::config::{AllowedOrigin, Config, Cors};
+use shuftle_server::config::{
+    AllowedOrigin, Config, Cors,
+    test_utils::{canonical_origin, origin_parts},
+};
 
 #[test]
 fn reads_the_listen_address() -> anyhow::Result<()> {
@@ -27,26 +30,6 @@ fn reads_the_listen_address() -> anyhow::Result<()> {
     };
     ensure!(actual == expected, "got {actual:?}, expected {expected:?}");
     Ok(())
-}
-
-/// The parts of an origin as browsers send it: a scheme with its default port, a lowercase host
-/// and a port only when it is not the scheme's default.
-fn origin_parts() -> impl Strategy<Value = (&'static str, u16, String, Option<u16>)> {
-    let scheme = prop_oneof![(Just("http"), Just(80_u16)), (Just("https"), Just(443_u16))];
-    let host = "[a-z][a-z0-9]{0,10}(\\.[a-z][a-z0-9]{0,10}){0,3}";
-    (scheme, host, option::of(1_u16..))
-        .prop_filter("default port", |((_, default_port), _, port)| {
-            *port != Some(*default_port)
-        })
-        .prop_map(|((scheme, default_port), host, port)| (scheme, default_port, host, port))
-}
-
-/// Origins written as browsers send them.
-fn canonical_origin() -> impl Strategy<Value = String> {
-    origin_parts().prop_map(|(scheme, _, host, port)| match port {
-        Some(port) => format!("{scheme}://{host}:{port}"),
-        None => format!("{scheme}://{host}"),
-    })
 }
 
 /// An origin as browsers send it, and the same origin written in a way browsers never send.

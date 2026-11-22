@@ -4,21 +4,12 @@ use anyhow::ensure;
 use bytes::Bytes;
 use http::{HeaderValue, Request, header::CONTENT_TYPE};
 use http_body_util::Full;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use test_utils::spawn_server;
-
-/// The content type of gRPC-Web requests and responses carrying protobuf.
-const GRPC_WEB: &str = "application/grpc-web+proto";
-
-/// A gRPC message frame holding an empty message: no compression flag, then a length of 0.
-const EMPTY_MESSAGE: [u8; 5] = [0; 5];
+use test_utils::{EMPTY_MESSAGE, GRPC_WEB, http2_client, spawn_server};
 
 #[tokio::test]
 async fn grpc_web_requests_get_grpc_web_responses() -> anyhow::Result<()> {
     let address = spawn_server().await?;
-    let client = Client::builder(TokioExecutor::new())
-        .http2_only(true)
-        .build_http();
+    let client = http2_client();
     let request = Request::post(format!(
         "http://{address}/shuftle.version.v1.VersionService/GetVersion"
     ))

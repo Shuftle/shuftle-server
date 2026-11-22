@@ -21,6 +21,8 @@ tonic-web = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
+tower-http = { version = "0.7", features = ["cors"] }
+http = "1"
 prost = "0.14"
 prost-types = "0.14"
 protox = "0.10"
@@ -32,7 +34,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 
 # Test clients.
 bytes = "1"
-http = "1"
+http-body = "1"
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
 
