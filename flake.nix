@@ -29,6 +29,7 @@
             bacon
             cargo-deny
             cargo-edit
+            cargo-mutants
             rust-analyzer
             rust-bin.stable.latest.default
           ];

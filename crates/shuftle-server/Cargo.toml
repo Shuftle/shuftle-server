@@ -7,5 +7,28 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+anyhow.workspace = true
+shuftle-proto.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-web.workspace = true
+tonic-reflection = { workspace = true, optional = true }
+
+[features]
+# Development only: gRPC reflection for tools such as grpcurl, and HTTP/1.1 for browsers reaching
+# the server without TLS. Never in release builds.
+dev = ["dep:tonic-reflection"]
+
+[dev-dependencies]
+shuftle-proto = { workspace = true, features = ["client"] }
+semver.workspace = true
+test-utils.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper-util.workspace = true
+
 [lints]
 workspace = true

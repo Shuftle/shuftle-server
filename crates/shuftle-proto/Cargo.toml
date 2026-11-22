@@ -1,0 +1,29 @@
+[package]
+name = "shuftle-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# The generated gRPC clients. The server needs them only in tests.
+client = []
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+semver.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+prost.workspace = true
+anyhow.workspace = true
+protox.workspace = true
+semver.workspace = true
+tonic-prost-build.workspace = true
+
+[lints]
+workspace = true
