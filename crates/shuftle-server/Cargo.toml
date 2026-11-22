@@ -9,12 +9,17 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
 shuftle-proto.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+toml.workspace = true
 tonic.workspace = true
 tonic-web.workspace = true
 tonic-reflection = { workspace = true, optional = true }
+url.workspace = true
 
 [features]
 # Development only: gRPC reflection for tools such as grpcurl, and HTTP/1.1 for browsers reaching
@@ -29,6 +34,7 @@ bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper-util.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

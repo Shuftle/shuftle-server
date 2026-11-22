@@ -1,24 +1,34 @@
 //! The Shuftle multiplayer server.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::{fs, path::PathBuf};
 
 use anyhow::Context;
+use clap::Parser;
+use shuftle_server::config::Config;
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
 };
 
-/// gRPC's conventional port.
-const PORT: u16 = 50051;
-
-/// Where the server listens: this machine only.
-const LISTEN_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, PORT));
+/// The Shuftle multiplayer server.
+#[derive(Parser)]
+struct Args {
+    /// The TOML configuration file.
+    #[arg(long)]
+    config: PathBuf,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let listener = TcpListener::bind(LISTEN_ADDR)
+    let args = Args::parse();
+    let path = args.config.display();
+    let config: Config = fs::read_to_string(&args.config)
+        .with_context(|| format!("reading {path}"))?
+        .parse()
+        .with_context(|| format!("reading {path}"))?;
+    let listener = TcpListener::bind(config.listen)
         .await
-        .with_context(|| format!("binding {LISTEN_ADDR}"))?;
+        .with_context(|| format!("binding {}", config.listen))?;
     let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("listening for SIGINT")?;
     let shutdown = async move {

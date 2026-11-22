@@ -1,5 +1,7 @@
 //! The Shuftle multiplayer server.
 
+pub mod config;
+
 use anyhow::Context;
 use shuftle_proto::{
     PROTOCOL_VERSION,
