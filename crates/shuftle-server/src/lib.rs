@@ -1,14 +1,19 @@
 //! The Shuftle multiplayer server.
 
+mod auth;
 pub mod config;
+mod matchmaking;
 
 use std::time::Duration;
 
 use anyhow::Context;
-use config::Cors;
+use auth::AuthLayer;
+use config::{Auth, Cors};
 use http::{HeaderName, HeaderValue, Method, header::CONTENT_TYPE};
+use matchmaking::Matchmaking;
 use shuftle_proto::{
     PROTOCOL_VERSION,
+    shuftle::matchmaking::v1::matchmaking_service_server::MatchmakingServiceServer,
     shuftle::version::v1::{
         self, GetVersionRequest, GetVersionResponse,
         version_service_server::{VersionService, VersionServiceServer},
@@ -44,7 +49,7 @@ const EXPOSED_HEADERS: [HeaderName; 3] = [
 ];
 
 /// Serves every service on `listener`, over gRPC and gRPC-Web to the browser pages `cors` allows,
-/// until `shutdown` completes.
+/// until `shutdown` completes. Calls outside the public services need a token `auth` accepts.
 ///
 /// # Errors
 ///
@@ -52,13 +57,16 @@ const EXPOSED_HEADERS: [HeaderName; 3] = [
 pub async fn serve(
     listener: TcpListener,
     cors: Cors,
+    auth: Auth,
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     let router = Server::builder()
         .accept_http1(cfg!(feature = "dev"))
         .layer(cors_layer(&cors)?)
         .layer(GrpcWebLayer::new())
-        .add_service(VersionServiceServer::new(Version));
+        .layer(AuthLayer::new(&auth).context("building the authentication layer")?)
+        .add_service(VersionServiceServer::new(Version))
+        .add_service(MatchmakingServiceServer::new(Matchmaking));
     #[cfg(feature = "dev")]
     let router = router.add_service(
         tonic_reflection::server::Builder::configure()

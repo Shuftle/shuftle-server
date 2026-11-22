@@ -14,6 +14,8 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Which browser pages may call the server.
     pub cors: Cors,
+    /// How callers prove who they are.
+    pub auth: Auth,
 }
 
 impl FromStr for Config {
@@ -22,6 +24,18 @@ impl FromStr for Config {
     fn from_str(toml: &str) -> Result<Self, Self::Err> {
         toml::from_str(toml)
     }
+}
+
+/// The identity provider whose access tokens the server accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// The `iss` every token must carry, exactly.
+    pub issuer: Url,
+    /// The `aud` every token must include: this server's client id at the identity provider.
+    pub audience: String,
+    /// Where the identity provider publishes its signing keys as a JWK Set.
+    pub jwks_url: Url,
 }
 
 /// Cross-origin access for browsers.
