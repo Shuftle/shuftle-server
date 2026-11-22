@@ -3,3 +3,8 @@ listen = "127.0.0.1:50051"
 
 [cors]
 allowed_origins = []
+
+[auth]
+issuer = "http://localhost:8180/realms/shuftle"
+audience = "shuftle-server"
+jwks_url = "http://localhost:8180/realms/shuftle/protocol/openid-connect/certs"

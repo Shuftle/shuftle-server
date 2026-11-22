@@ -8,9 +8,10 @@ use proptest::{
     strategy::{Just, Strategy},
 };
 use shuftle_server::config::{
-    AllowedOrigin, Config, Cors,
+    AllowedOrigin, Auth, Config, Cors,
     test_utils::{canonical_origin, origin_parts},
 };
+use url::Url;
 
 #[test]
 fn reads_the_listen_address() -> anyhow::Result<()> {
@@ -19,6 +20,11 @@ fn reads_the_listen_address() -> anyhow::Result<()> {
 
         [cors]
         allowed_origins = []
+
+        [auth]
+        issuer = "https://keycloak.example/realms/shuftle"
+        audience = "shuftle-server"
+        jwks_url = "https://keycloak.example/realms/shuftle/protocol/openid-connect/certs"
     "#
     .parse()?;
 
@@ -26,6 +32,13 @@ fn reads_the_listen_address() -> anyhow::Result<()> {
         listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 50051)),
         cors: Cors {
             allowed_origins: Vec::new(),
+        },
+        auth: Auth {
+            issuer: Url::parse("https://keycloak.example/realms/shuftle")?,
+            audience: "shuftle-server".to_owned(),
+            jwks_url: Url::parse(
+                "https://keycloak.example/realms/shuftle/protocol/openid-connect/certs",
+            )?,
         },
     };
     ensure!(actual == expected, "got {actual:?}, expected {expected:?}");
