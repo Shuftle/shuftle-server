@@ -15,8 +15,10 @@ use shuftle_proto::{
     },
 };
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Server, server::TcpIncoming},
+};
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -64,8 +66,10 @@ pub async fn serve(
             .build_v1()
             .context("building the reflection service")?,
     );
+    // TCP_NODELAY as tonic enables it by default; its builder setting skips a listener passed in.
+    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
     router
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .context("serving")
 }

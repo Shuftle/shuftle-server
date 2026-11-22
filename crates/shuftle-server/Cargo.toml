@@ -15,7 +15,6 @@ serde.workspace = true
 shuftle-proto.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
 toml.workspace = true
 tonic.workspace = true
 tonic-web.workspace = true

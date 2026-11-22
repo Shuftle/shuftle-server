@@ -30,7 +30,6 @@ semver = "1"
 
 # Runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
-tokio-stream = { version = "0.1", features = ["net"] }
 
 # Test clients.
 bytes = "1"

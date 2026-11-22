@@ -1204,7 +1204,6 @@ dependencies = [
  "test-utils",
  "thiserror",
  "tokio",
- "tokio-stream",
  "toml",
  "tonic",
  "tonic-reflection",
