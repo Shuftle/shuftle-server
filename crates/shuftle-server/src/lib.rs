@@ -1,6 +1,12 @@
 //! The Shuftle multiplayer server.
 
+pub mod config;
+
+use std::time::Duration;
+
 use anyhow::Context;
+use config::Cors;
+use http::{HeaderName, HeaderValue, Method, header::CONTENT_TYPE};
 use shuftle_proto::{
     PROTOCOL_VERSION,
     shuftle::version::v1::{
@@ -9,21 +15,48 @@ use shuftle_proto::{
     },
 };
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Server, server::TcpIncoming},
+};
 use tonic_web::GrpcWebLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
-/// Serves every service on `listener`, over gRPC and gRPC-Web, until `shutdown` completes.
+/// How long browsers may reuse a preflight's answer: a day, as tonic-web's former built-in CORS
+/// support used. Browsers may cap it lower.
+const PREFLIGHT_MAX_AGE: Duration = Duration::from_hours(24);
+
+/// The request headers browser pages may send: gRPC-Web's, and the protocol version every call
+/// but `GetVersion` carries.
+const ALLOWED_HEADERS: [HeaderName; 5] = [
+    CONTENT_TYPE,
+    HeaderName::from_static("x-grpc-web"),
+    HeaderName::from_static("x-user-agent"),
+    HeaderName::from_static("grpc-timeout"),
+    HeaderName::from_static("shuftle-protocol-version"),
+];
+
+/// The response headers browser pages may read: the call's gRPC status.
+const EXPOSED_HEADERS: [HeaderName; 3] = [
+    HeaderName::from_static("grpc-status"),
+    HeaderName::from_static("grpc-message"),
+    HeaderName::from_static("grpc-status-details-bin"),
+];
+
+/// Serves every service on `listener`, over gRPC and gRPC-Web to the browser pages `cors` allows,
+/// until `shutdown` completes.
 ///
 /// # Errors
 ///
 /// Returns the error that kept the server from starting or stopped it.
 pub async fn serve(
     listener: TcpListener,
+    cors: Cors,
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     let router = Server::builder()
         .accept_http1(cfg!(feature = "dev"))
+        .layer(cors_layer(&cors)?)
         .layer(GrpcWebLayer::new())
         .add_service(VersionServiceServer::new(Version));
     #[cfg(feature = "dev")]
@@ -33,10 +66,30 @@ pub async fn serve(
             .build_v1()
             .context("building the reflection service")?,
     );
+    // TCP_NODELAY as tonic enables it by default; its builder setting skips a listener passed in.
+    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
     router
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .context("serving")
+}
+
+/// Lets the pages `cors` allows make gRPC-Web calls, without credentials.
+fn cors_layer(cors: &Cors) -> anyhow::Result<CorsLayer> {
+    let origins = cors
+        .allowed_origins
+        .iter()
+        .map(|origin| {
+            HeaderValue::from_str(origin.as_str())
+                .with_context(|| format!("`{}` is not a header value", origin.as_str()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::POST])
+        .allow_headers(ALLOWED_HEADERS)
+        .expose_headers(EXPOSED_HEADERS)
+        .max_age(PREFLIGHT_MAX_AGE))
 }
 
 /// Answers which protocol version the server speaks.

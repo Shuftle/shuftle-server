@@ -1,0 +1,5 @@
+# Local development: this machine only.
+listen = "127.0.0.1:50051"
+
+[cors]
+allowed_origins = []

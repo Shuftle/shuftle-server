@@ -9,26 +9,36 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+http.workspace = true
+serde.workspace = true
 shuftle-proto.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
+toml.workspace = true
 tonic.workspace = true
 tonic-web.workspace = true
+tower-http.workspace = true
 tonic-reflection = { workspace = true, optional = true }
+proptest = { workspace = true, optional = true }
+url.workspace = true
 
 [features]
 # Development only: gRPC reflection for tools such as grpcurl, and HTTP/1.1 for browsers reaching
 # the server without TLS. Never in release builds.
 dev = ["dep:tonic-reflection"]
+# Property-test strategies for this crate's types, for its own tests.
+testing = ["dep:proptest"]
 
 [dev-dependencies]
 shuftle-proto = { workspace = true, features = ["client"] }
+shuftle-server = { workspace = true, features = ["testing"] }
 semver.workspace = true
 test-utils.workspace = true
 bytes.workspace = true
-http.workspace = true
 http-body-util.workspace = true
 hyper-util.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true
