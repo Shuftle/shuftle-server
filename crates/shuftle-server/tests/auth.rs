@@ -23,7 +23,7 @@ use test_utils::{
 };
 use tokio::{
     task::JoinSet,
-    time::{advance, sleep, timeout},
+    time::{Instant, advance, sleep, timeout},
 };
 use tonic::{Code, Request, Status, client::Grpc, metadata::MetadataValue, transport::Channel};
 use tonic_prost::ProstCodec;
@@ -146,9 +146,6 @@ async fn refuses_with_unavailable_when_keys_hang() -> anyhow::Result<()> {
         .context("the call hung")?
 }
 
-/// How long the server trusts the keys it fetched.
-const MAX_KEY_AGE: Duration = Duration::from_mins(10);
-
 #[tokio::test(start_paused = true)]
 async fn refetches_keys_older_than_max_age() -> anyhow::Result<()> {
     let keys = KeyServer::start(&[TestKey::published()?]).await?;
@@ -166,8 +163,8 @@ async fn refetches_keys_older_than_max_age() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How long the server waits for the identity provider's keys.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the server trusts the keys it fetched.
+const MAX_KEY_AGE: Duration = Duration::from_mins(10);
 
 /// How long before the keys expire the server starts refetching them in the background.
 const REFRESH_AHEAD: Duration = Duration::from_mins(2);
@@ -186,9 +183,14 @@ async fn refreshes_keys_in_the_background_before_they_expire() -> anyhow::Result
 
     keys.hang();
     advance(MAX_KEY_AGE - REFRESH_AHEAD + Duration::from_secs(1)).await;
-    timeout(FETCH_TIMEOUT / 2, ensure_accepted(address, &token))
-        .await
-        .context("the call waited for the refresh")??;
+    // On the paused clock, time only passes while a call waits on a timer, such as a fetch timeout.
+    let before = Instant::now();
+    ensure_accepted(address, &token).await?;
+    let waited = before.elapsed();
+    ensure!(
+        waited.is_zero(),
+        "the call waited {waited:?} for the refresh"
+    );
 
     timeout(HANG_GUARD, async {
         while keys.fetches() < 2 {
