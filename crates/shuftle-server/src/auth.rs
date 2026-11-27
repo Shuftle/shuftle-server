@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use anyhow::{Context as _, anyhow};
@@ -15,6 +16,7 @@ use jsonwebtoken::{
 };
 use serde::de::IgnoredAny;
 use thiserror::Error;
+use tokio::{sync::Mutex, time::Instant};
 use tonic::Status;
 use tower_layer::Layer;
 use tower_service::Service;
@@ -45,8 +47,9 @@ impl AuthLayer {
         Ok(Self {
             keys: Arc::new(SigningKeys {
                 url: auth.jwks_url.clone(),
-                client: reqwest::Client::builder().build()?,
-                cached: RwLock::new(JwkSet { keys: Vec::new() }),
+                client: reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?,
+                cached: RwLock::new(None),
+                missed_at: Arc::new(Mutex::new(None)),
             }),
             validation: Arc::new(validation(auth)),
         })
@@ -117,7 +120,7 @@ fn validation(auth: &Auth) -> Validation {
 
 /// Checks the access token in `headers` against `validation`.
 async fn authenticate(
-    keys: &SigningKeys,
+    keys: &Arc<SigningKeys>,
     validation: &Validation,
     headers: &HeaderMap,
 ) -> Result<(), Refusal> {
@@ -145,38 +148,113 @@ async fn authenticate(
     Ok(())
 }
 
+/// How long fetching the signing keys may take before the call is refused as unavailable.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long fetching the signing keys pauses after a fetch that failed or lacked the requested key,
+/// so tokens naming made-up keys cannot make every call fetch.
+const MIN_REFETCH_INTERVAL: Duration = Duration::from_mins(1);
+
+/// How long fetched signing keys are trusted, so a key the identity provider removed stops being
+/// accepted.
+const MAX_KEY_AGE: Duration = Duration::from_mins(10);
+
+/// How long before the signing keys expire a call starts refetching them in the background, so
+/// calls rarely wait for a fetch. Longer than [`MIN_REFETCH_INTERVAL`], so a failed refresh gets
+/// retried before the keys expire.
+const REFRESH_AHEAD: Duration = Duration::from_mins(2);
+
 /// The identity provider's signing keys, fetched from its JWK Set and refreshed when a token names
-/// a key not seen yet.
+/// a key not seen yet or when they near [`MAX_KEY_AGE`].
 #[derive(Debug)]
 struct SigningKeys {
     url: Url,
     client: reqwest::Client,
-    cached: RwLock<JwkSet>,
+    /// The last key set fetched, if any.
+    cached: RwLock<Option<Fetched>>,
+    /// When the last fetch failed or lacked the requested key.
+    missed_at: Arc<Mutex<Option<Instant>>>,
+}
+
+/// A key set and when it was fetched.
+#[derive(Debug)]
+struct Fetched {
+    keys: JwkSet,
+    at: Instant,
 }
 
 impl SigningKeys {
-    /// The key named `kid`, refetching the key set when it is not cached.
-    async fn find(&self, kid: &str) -> Result<Option<Jwk>, Refusal> {
-        let cached = self
-            .cached
-            .read()
-            .map_err(|error| Refusal::Internal(anyhow!("reading the key cache: {error}")))?
-            .find(kid)
-            .cloned();
-        if cached.is_some() {
-            return Ok(cached);
+    /// The key named `kid`, refetching the key set when it is not cached or too old.
+    async fn find(self: &Arc<Self>, kid: &str) -> Result<Option<Jwk>, Refusal> {
+        if let Some((jwk, fetched_at)) = self.cached(kid)? {
+            if fetched_at.elapsed() > MAX_KEY_AGE - REFRESH_AHEAD {
+                self.refresh_in_background();
+            }
+            return Ok(Some(jwk));
         }
-        let fresh = self
-            .fetch()
-            .await
-            .with_context(|| format!("fetching the signing keys from {}", self.url))
-            .map_err(Refusal::Unavailable)?;
-        let found = fresh.find(kid).cloned();
+        // Held during the fetch: calls missing the same key wait for it, then find the key cached.
+        let mut missed_at = self.missed_at.lock().await;
+        if let Some((jwk, _)) = self.cached(kid)? {
+            return Ok(Some(jwk));
+        }
+        if paused(*missed_at) {
+            return Err(Refusal::Unavailable(anyhow!(
+                "signing key {kid} not cached, and the last fetch missed less than {MIN_REFETCH_INTERVAL:?} ago"
+            )));
+        }
+        self.refetch(&mut missed_at).await?;
+        let found = self.cached(kid)?.map(|(jwk, _)| jwk);
+        if found.is_none() {
+            *missed_at = Some(Instant::now());
+        }
+        Ok(found)
+    }
+
+    /// Refetches the key set in a task of its own, unless a fetch is running or fetching is paused.
+    fn refresh_in_background(self: &Arc<Self>) {
+        let Ok(mut missed_at) = Arc::clone(&self.missed_at).try_lock_owned() else {
+            return;
+        };
+        if paused(*missed_at) {
+            return;
+        }
+        let keys = Arc::clone(self);
+        // A failed refresh is recorded in `missed_at`; calls keep using the cached keys.
+        tokio::spawn(async move { keys.refetch(&mut missed_at).await });
+    }
+
+    /// Fetches the key set into the cache, recording a miss in `missed_at` when the fetch fails.
+    async fn refetch(&self, missed_at: &mut Option<Instant>) -> Result<(), Refusal> {
+        let fresh = match self.fetch().await {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                *missed_at = Some(Instant::now());
+                return Err(Refusal::Unavailable(
+                    error.context(format!("fetching the signing keys from {}", self.url)),
+                ));
+            }
+        };
         *self
             .cached
             .write()
-            .map_err(|error| Refusal::Internal(anyhow!("writing the key cache: {error}")))? = fresh;
-        Ok(found)
+            .map_err(|error| Refusal::Internal(anyhow!("writing the key cache: {error}")))? =
+            Some(Fetched {
+                keys: fresh,
+                at: Instant::now(),
+            });
+        Ok(())
+    }
+
+    /// The cached key named `kid` and when it was fetched, unless the cache is older than
+    /// [`MAX_KEY_AGE`].
+    fn cached(&self, kid: &str) -> Result<Option<(Jwk, Instant)>, Refusal> {
+        Ok(self
+            .cached
+            .read()
+            .map_err(|error| Refusal::Internal(anyhow!("reading the key cache: {error}")))?
+            .as_ref()
+            .filter(|fetched| fetched.at.elapsed() < MAX_KEY_AGE)
+            .and_then(|fetched| Some((fetched.keys.find(kid)?.clone(), fetched.at))))
     }
 
     /// The key set the identity provider publishes now.
@@ -190,6 +268,11 @@ impl SigningKeys {
             .json()
             .await?)
     }
+}
+
+/// Whether fetching is paused after the miss at `missed_at`.
+fn paused(missed_at: Option<Instant>) -> bool {
+    missed_at.is_some_and(|at| at.elapsed() < MIN_REFETCH_INTERVAL)
 }
 
 /// Why a call did not reach its service: one variant per thing the caller must do. Each carries
