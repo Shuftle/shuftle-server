@@ -1,11 +1,13 @@
 //! Helpers shared by the Shuftle server's tests.
 
 use std::{
-    convert::Infallible,
     fmt::Debug,
     future,
     net::SocketAddr,
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +21,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http_body::Body;
 use http_body_util::Full;
-use hyper::{Response, server::conn::http1, service::service_fn};
+use hyper::{Response, StatusCode, server::conn::http1, service::service_fn};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
@@ -48,10 +50,7 @@ use url::Url;
 ///
 /// Returns the error that kept the server from listening.
 pub async fn spawn_server() -> anyhow::Result<SocketAddr> {
-    spawn_server_with_cors(Cors {
-        allowed_origins: Vec::new(),
-    })
-    .await
+    spawn_server_with_keys(KeyServer::start(&[TestKey::published()?]).await?.url()).await
 }
 
 /// Starts the server on a free port of this machine, allowing the browser pages `cors` allows, and
@@ -61,7 +60,29 @@ pub async fn spawn_server() -> anyhow::Result<SocketAddr> {
 ///
 /// Returns the error that kept the server from listening.
 pub async fn spawn_server_with_cors(cors: Cors) -> anyhow::Result<SocketAddr> {
-    let jwks_url = serve_keys(vec![TestKey::published()?.jwk.clone()]).await?;
+    let keys = KeyServer::start(&[TestKey::published()?]).await?;
+    spawn(cors, keys.url().clone()).await
+}
+
+/// Starts the server on a free port of this machine, trusting the keys published at `jwks_url`,
+/// and returns its address. The server runs until the test's runtime shuts down.
+///
+/// # Errors
+///
+/// Returns the error that kept the server from listening.
+pub async fn spawn_server_with_keys(jwks_url: &Url) -> anyhow::Result<SocketAddr> {
+    spawn(
+        Cors {
+            allowed_origins: Vec::new(),
+        },
+        jwks_url.clone(),
+    )
+    .await
+}
+
+/// Starts the server on a free port of this machine with `cors`, trusting the keys published at
+/// `jwks_url`, and returns its address.
+async fn spawn(cors: Cors, jwks_url: Url) -> anyhow::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(shuftle_server::serve(
@@ -171,11 +192,13 @@ pub struct TestKey {
     jwk: Jwk,
 }
 
-/// The test identity provider's keys, generated on first use: one it publishes, one it does not.
-static KEYS: LazyLock<Result<[TestKey; 2], String>> = LazyLock::new(|| {
+/// The test identity provider's keys, generated on first use: one it publishes, one it does not,
+/// and one it publishes later.
+static KEYS: LazyLock<Result<[TestKey; 3], String>> = LazyLock::new(|| {
     Ok([
         TestKey::generate("published").map_err(|error| format!("{error:#}"))?,
         TestKey::generate("unpublished").map_err(|error| format!("{error:#}"))?,
+        TestKey::generate("rotated").map_err(|error| format!("{error:#}"))?,
     ])
 });
 
@@ -186,7 +209,7 @@ impl TestKey {
     ///
     /// Returns the error that kept the keys from being generated.
     pub fn published() -> anyhow::Result<&'static Self> {
-        let [published, _] = KEYS.as_ref().map_err(|error| anyhow!("{error}"))?;
+        let [published, _, _] = KEYS.as_ref().map_err(|error| anyhow!("{error}"))?;
         Ok(published)
     }
 
@@ -196,8 +219,18 @@ impl TestKey {
     ///
     /// Returns the error that kept the keys from being generated.
     pub fn unpublished() -> anyhow::Result<&'static Self> {
-        let [_, unpublished] = KEYS.as_ref().map_err(|error| anyhow!("{error}"))?;
+        let [_, unpublished, _] = KEYS.as_ref().map_err(|error| anyhow!("{error}"))?;
         Ok(unpublished)
+    }
+
+    /// A key the test identity provider publishes while the server runs, as in a key rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that kept the keys from being generated.
+    pub fn rotated() -> anyhow::Result<&'static Self> {
+        let [_, _, rotated] = KEYS.as_ref().map_err(|error| anyhow!("{error}"))?;
+        Ok(rotated)
     }
 
     /// Generates an RSA key named `kid` for RS256, as Keycloak signs by default. jsonwebtoken takes
@@ -279,25 +312,141 @@ impl Claims {
     }
 }
 
-/// Publishes `keys` as a JWK Set on a free port of this machine, standing in for the identity
-/// provider, until the test's runtime shuts down. Returns where the keys are published.
+/// The test identity provider's JWK Set endpoint, on a free port of this machine until the test's
+/// runtime shuts down.
+pub struct KeyServer {
+    /// Where the keys are published.
+    url: Url,
+    /// The keys published now.
+    keys: Arc<RwLock<JwkSet>>,
+    /// How many times the keys have been fetched.
+    fetches: Arc<AtomicUsize>,
+    /// Whether requests go unanswered.
+    hanging: Arc<AtomicBool>,
+}
+
+impl KeyServer {
+    /// Starts publishing `keys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that kept the server from listening.
+    pub async fn start(keys: &[&TestKey]) -> anyhow::Result<Self> {
+        let keys = Arc::new(RwLock::new(JwkSet {
+            keys: keys.iter().map(|key| key.jwk.clone()).collect(),
+        }));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&keys);
+        let counted = Arc::clone(&fetches);
+        let hanging = Arc::new(AtomicBool::new(false));
+        let hangs = Arc::clone(&hanging);
+        let url = listen(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            if hangs.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            Ok(Some(Response::new(Full::new(encode(&served)?))))
+        })
+        .await?;
+        Ok(Self {
+            url,
+            keys,
+            fetches,
+            hanging,
+        })
+    }
+
+    /// Where the keys are published.
+    #[must_use]
+    pub const fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// How many times the keys have been fetched.
+    #[must_use]
+    pub fn fetches(&self) -> usize {
+        self.fetches.load(Ordering::SeqCst)
+    }
+
+    /// Adds `key` to the published keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that kept the keys from being updated.
+    pub fn publish(&self, key: &TestKey) -> anyhow::Result<()> {
+        self.keys
+            .write()
+            .map_err(|error| anyhow!("writing the published keys: {error}"))?
+            .keys
+            .push(key.jwk.clone());
+        Ok(())
+    }
+
+    /// Leaves every later request unanswered, standing in for an identity provider that hangs. The
+    /// requests still count as fetches.
+    pub fn hang(&self) {
+        self.hanging.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Starts a JWK Set endpoint that answers every request with 503 Service Unavailable, standing in
+/// for an identity provider that cannot serve its keys, and returns where it listens.
 ///
 /// # Errors
 ///
-/// Returns the error that kept the keys from being encoded or the server from listening.
-async fn serve_keys(keys: Vec<Jwk>) -> anyhow::Result<Url> {
-    let body = Bytes::from(serde_json::to_vec(&JwkSet { keys })?);
+/// Returns the error that kept the endpoint from listening.
+pub async fn failing_key_endpoint() -> anyhow::Result<Url> {
+    listen(|| {
+        Ok(Some(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Full::default())?,
+        ))
+    })
+    .await
+}
+
+/// Starts a JWK Set endpoint that never answers, standing in for an identity provider that hangs,
+/// and returns where it listens.
+///
+/// # Errors
+///
+/// Returns the error that kept the endpoint from listening.
+pub async fn hanging_key_endpoint() -> anyhow::Result<Url> {
+    listen(|| Ok(None)).await
+}
+
+/// Serves HTTP/1.1 on a free port of this machine until the test's runtime shuts down, answering
+/// every request with what `respond` returns, or never when it returns `None`, and returns the JWK
+/// Set URL there.
+async fn listen<F>(respond: F) -> anyhow::Result<Url>
+where
+    F: Fn() -> anyhow::Result<Option<Response<Full<Bytes>>>> + Clone + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = Url::parse(&format!("http://{}/jwks", listener.local_addr()?))?;
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let body = body.clone();
+            let respond = respond.clone();
             let service = service_fn(move |_request| {
-                let response = Response::new(Full::new(body.clone()));
-                async move { Ok::<_, Infallible>(response) }
+                let response = respond();
+                async move {
+                    match response? {
+                        Some(response) => anyhow::Ok(response),
+                        None => future::pending().await,
+                    }
+                }
             });
             tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(stream), service));
         }
     });
     Ok(url)
+}
+
+/// The JSON of the key set `keys` holds now.
+fn encode(keys: &RwLock<JwkSet>) -> anyhow::Result<Bytes> {
+    let keys = keys
+        .read()
+        .map_err(|error| anyhow!("reading the published keys: {error}"))?;
+    Ok(Bytes::from(serde_json::to_vec(&*keys)?))
 }

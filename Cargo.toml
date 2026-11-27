@@ -34,7 +34,7 @@ protox = "0.10"
 semver = "1"
 
 # Runtime.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
 
 # Test clients.
 aws-lc-rs = "1"
